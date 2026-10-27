@@ -29,7 +29,7 @@ The modern way to intercept kernel functions on 5.x+ kernels. Instead of patchin
 `list_del(&THIS_MODULE->list)` splices the module out of the kernel's module linked list; `lsmod` and `/proc/modules` both iterate that list. `kobject_del` removes it from `/sys/module`. The list pointer is saved so it can be re-inserted cleanly on `rmmod`.
  
 ### Privilege escalation
-`prepare_creds()` clones a task's credentials, all UID/GID fields get zeroed, and `commit_creds()` installs the new credentials on the target process. Same API used by `sudo` — just pointed at a process that didn't ask for it.
+`prepare_creds()` clones a task's credentials, all UID/GID fields get zeroed, and `commit_creds()` installs the new credentials on the target process. Same API used by `sudo`; just pointed at a process that didn't ask for it.
  
 ---
  
