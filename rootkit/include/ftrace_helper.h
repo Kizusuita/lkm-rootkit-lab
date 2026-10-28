@@ -32,11 +32,12 @@ struct ftrace_hook { // Struct = bundle of related variables grouped tgthr in on
 };
 
 #define HOOK(_name, _hook, _orig) \
-{
+{                        \
     .name = (_name),     \
     .function = (_hook), \
     .original = (_orig), \
 }
+
 /* Above is a macro: it's just a text substitution. Before compiling, the compiler finds every use of HOOK and replaces it
  * with whatever's defined within. It's a shortcut so I don't have to type out a ftrace_hook struct every time.
  * The \ are just for readability, it's technically all on one line. */
@@ -52,6 +53,7 @@ static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
         regs->ip = (unsigned long)hook->function;
 
 }
+
 /* More explaination, yay.
  * notrace = tells ftrace to never hook this function itself, bc otherwise it'd be recursive
  * The Parameters:
@@ -102,6 +104,92 @@ static int fh_install_hook(struct ftrace_hook *hook)
 }
 
 /* Another paragraph:
+ * -> is how you're accessing the data within the struct, it's by name within the struct
+ * kallsyms_lookup_name() = looks up memory addr of kernel function by name at runtime. If ret 0; doesn't exist
+ * pr_err() = It's the kernel equiv of printf, it'll show up in dmesg
+ * return -ENOENT = kernel convention for ret err, means "no such entry"
+ * *((usigned long*)hook->original)... blah = stores real function's address into the pointer the caller gave, so it can
+ *                                            call the pointer later. It's casting the original hook from a "void *" to an
+ *                                            "unsigned long *" so the compiler knows what size it's gonna be working with.
+ *                                            It's wrapped in a *() to DEREFERENCE it, aka "go to that mem addr and get
+ *                                            what's there", and finally the = hook->address writes h.address into that mem
+ *                                            location.
+ * hook->ops.func = fh_... = tells ftrace which callback to call; the thunk from the prev step
+ *
+ * The Flags:
+ *      SAVE_REGS = Save CPU regs so can mod 'ip' correctly
+ *      RECURSION = Prevent recursive calls
+ *      IPMODIFY = Tells ftrace we intend to change the ip
+ *
+ * ftrace_set_filter_ip = tells ftrace to only fire callback when *this specific* addr is hit, not every function call in
+ *                        the kernel
+ * register_ftrace_function = activate hook; after this thunk happens on every call to the target function.
+ */
+
+static void fh_remove_hook(struct ftrace_hook *hook)
+{
+    unregister_ftrace_function(&hook->ops);
+    ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+}
+
+static int fh_install_hooks(struct ftrace_hook *hooks, size_t count)
+{
+    int err;
+    size_t i;
+
+    for( i = 0; i < count; i++){
+        err = fh_install_hook(&hooks[i]);
+        if(err)
+            goto error;
+    }
+    return 0;
+
+error:
+    while (i--)
+        fh_remove_hook(&hooks[i]);
+    return err;
+}
+
+static void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
+{
+    size_t i;
+    for (i = 0; i < count; i++)
+        fh_remove_hook(&hooks[i]);
+}
+
+/*
+ * fh_remove_hook = undoes what fh_install_hook did.
+ * unregister_ftrace_function = deactivates the callback, then ftrace_set_filter_ip with 1 as the third arg removes addr
+ *                              filter.
+ * fh_install_hooks/fh_remove_hooks = bulk versions that loop over an array of hooks, it lets install/remove en-masse
+ * goto error = Typically bad practice in C, but standard kernel pattern for clean-on-fail. If like #3 or 4 fails, the while
+ *              handles all previous hooks.
  */
 
 #endif /*_FTRACE_HELPER_H */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
